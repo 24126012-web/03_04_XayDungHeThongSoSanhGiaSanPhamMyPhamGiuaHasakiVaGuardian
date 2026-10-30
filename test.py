@@ -1,0 +1,1 @@
+print("Da ket noi Python voi VS Code thanh cong!")
