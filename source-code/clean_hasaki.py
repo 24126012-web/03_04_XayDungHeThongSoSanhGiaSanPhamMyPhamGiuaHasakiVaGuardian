@@ -1,0 +1,150 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+from urllib.parse import unquote
+from product_specs import legacy_volume, legacy_product_volume
+
+# ==============================================================================
+# CẤU HÌNH ĐƯỜNG DẪN TỆP
+# ==============================================================================
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+DATASET_DIR = os.path.join(PROJECT_DIR, "dataset")
+
+INPUT_FILE = os.path.join(DATASET_DIR, "hasaki_raw.csv")
+OUTPUT_FILE = os.path.join(DATASET_DIR, "hasaki_cleaned.csv")
+
+SUSPECT_BRANDS = ["SON", "KEM", "SỮA", "NUOC", "NƯỚC", "MẶT", "COMBO", "TINH", "BỘ", "DẦU", "GEL", "BÔNG", "XỊT"]
+
+# Bổ sung từ điển các hãng phổ biến
+BRAND_MAPPING = {
+    "L'OREAL": "L'Oreal", "MAYBELLINE": "Maybelline", "LA ROCHE-POSAY": "La Roche-Posay",
+    "LA ROCHE POSAY": "La Roche-Posay", "VICHY": "Vichy", "CERA VE": "CeraVe", 
+    "CERAVE": "CeraVe", "SKIN1004": "Skin1004", "DEAR KLAIRS": "Klairs", 
+    "KLAIRS": "Klairs", "PAULA'S CHOICE": "Paula's Choice", "D-PROGRAM": "d program", 
+    "D PROGRAM": "d program", "3CE": "3CE", "MAC": "MAC", "PERFECT DIARY": "Perfect Diary", 
+    "DR.ALTHEA": "Dr.Althea", "ST.IVES": "St.Ives", "ST. IVES": "St.Ives", 
+    "VASELINE": "Vaseline", "CETAPHIL": "Cetaphil", "SIMPLE": "Simple",
+    "GARNIER": "Garnier", "BIODERMA": "Bioderma", "HATOMUGI": "Hatomugi"
+}
+
+def extract_volume(text, url):
+    """Compatibility adapter; 1.0sp means unresolved, never verified."""
+    return legacy_volume(text, url)
+
+
+def extract_name_from_url(url):
+    """Khôi phục tên sản phẩm từ URL nếu tên bị rác (vd: 734/tháng)."""
+    if pd.isna(url):
+        return "Sản phẩm Hasaki chưa cập nhật"
+    try:
+        slug = str(url).split('/')[-1].replace('.html', '')
+        parts = slug.split('-')
+        if parts and parts[-1].isdigit():
+            parts = parts[:-1]
+        return " ".join(parts).title()
+    except:
+        return "Sản phẩm Hasaki chưa cập nhật"
+
+def clean_hasaki_data():
+    print("=" * 70)
+    print(" BẮT ĐẦU XỬ LÝ DỮ LIỆU SÀN HASAKI")
+    print("=" * 70)
+
+    if not os.path.exists(INPUT_FILE):
+        print(f"❌ Không tìm thấy file: {INPUT_FILE}")
+        return
+
+    df = pd.read_csv(INPUT_FILE, sep=";", encoding="utf-8-sig")
+    print(f"Đã tải {len(df)} bản ghi từ Hasaki.")
+
+    # 1. ĐIỀN KHUYẾT TÊN SẢN PHẨM & XỬ LÝ RÁC
+    df['product_name'] = df['product_name'].astype(str).str.strip()
+    df['product_name'] = df['product_name'].replace(['nan', 'None', ''], np.nan)
+    
+    mask_bad_name = df['product_name'].isna() | df['product_name'].str.match(r'^\d+/tháng', flags=re.IGNORECASE)
+    df.loc[mask_bad_name, 'product_name'] = df.loc[mask_bad_name, 'product_url'].apply(extract_name_from_url)
+
+    # 2. ĐIỀN KHUYẾT VÀ CHUẨN HÓA THƯƠNG HIỆU
+    df['brand'] = df['brand'].astype(str).str.strip()
+    df['brand'] = df['brand'].replace(['nan', 'None', ''], np.nan)
+    
+    for idx, row in df.iterrows():
+        b_name = str(row['brand']).strip()
+        p_name = str(row['product_name']).strip()
+        
+        if pd.isna(row['brand']) or b_name.upper() in SUSPECT_BRANDS:
+            found_brand = False
+            for key, correct_brand in BRAND_MAPPING.items():
+                if key in p_name.upper():
+                    df.at[idx, 'brand'] = correct_brand
+                    found_brand = True
+                    break
+            if not found_brand:
+                df.at[idx, 'brand'] = "No Brand"
+        else:
+            if b_name.upper() in BRAND_MAPPING:
+                df.at[idx, 'brand'] = BRAND_MAPPING[b_name.upper()]
+
+    # 3. TRÍCH QUY CÁCH; 1.0sp LÀ SENTINEL CHƯA XÁC ĐỊNH
+    df['volume_weight'] = df['volume_weight'].astype(str).str.strip()
+    df['volume_weight'] = df['volume_weight'].map(
+        lambda value: np.nan if value.lower() in ('nan', 'none', '') else value
+    ).astype(object)
+    
+    df['volume_val'] = np.nan
+    df['volume_unit'] = ""
+    
+    for idx, row in df.iterrows():
+        val, unit = legacy_product_volume(row['product_name'], row['volume_weight'], row['product_url'])
+        df.at[idx, 'volume_val'] = float(val)
+        df.at[idx, 'volume_unit'] = unit
+        # Preserve source specification; do not replace combo text with one size.
+        df.at[idx, 'volume_weight'] = row['volume_weight'] if pd.notna(row['volume_weight']) else row['product_name']
+
+    # 4. CHUẨN HÓA GIÁ VÀ TỈ LỆ GIẢM
+    df['current_price'] = pd.to_numeric(df['current_price'], errors='coerce').fillna(0).abs()
+    df['original_price'] = pd.to_numeric(df['original_price'], errors='coerce').fillna(0).abs()
+    
+    mask_fix_price = (df['original_price'] == 0) | (df['original_price'] < df['current_price'])
+    df.loc[mask_fix_price, 'original_price'] = df.loc[mask_fix_price, 'current_price']
+    
+    df['discount_percent'] = np.where(
+        df['original_price'] > 0,
+        np.round(((df['original_price'] - df['current_price']) / df['original_price']) * 100, 1),
+        0.0
+    )
+
+    # 5. TRIỆT TIÊU Ô TRỐNG ĐÁNH GIÁ (Lấp đầy Rating = 0.0)
+    df['rating'] = pd.to_numeric(df['rating'], errors='coerce').fillna(0.0)
+    df['review_count'] = pd.to_numeric(df['review_count'], errors='coerce').fillna(0).astype(int)
+    
+    df.loc[df['review_count'] < 0, 'review_count'] = 0
+    df['has_rating'] = np.where((df['rating'] > 0) & (df['review_count'] > 0), 1, 0)
+
+    # 6. SẮP XẾP VÀ XUẤT FILE 
+    df['category'] = df['category'].fillna('Chưa phân loại')
+    df['product_id'] = df['product_id'].fillna('Unknown')
+
+    final_cols = [
+        'source', 'product_id', 'product_name', 'brand', 'category', 
+        'volume_weight', 'volume_val', 'volume_unit', 
+        'current_price', 'original_price', 'discount_percent', 
+        'rating', 'review_count', 'has_rating', 'product_url'
+    ]
+    df = df[final_cols]
+    
+    # BẢO VỆ CHỐNG LỖI PERMISSION ERROR KHI LƯU FILE
+    try:
+        df.to_csv(OUTPUT_FILE, index=False, sep=";", encoding="utf-8-sig")
+        print("=" * 70)
+        print(f"🎉 Đã xử lý thành công")
+        print(f"   File Hasaki được lưu tại:\n   {OUTPUT_FILE}")
+        print("=" * 70)
+    except PermissionError:
+        print("\n❌ LỖI QUYỀN TRUY CẬP: FILE ĐANG BỊ MỞ HOẶC KHÓA!")
+        print(f"Không thể ghi đè lên file: {OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    clean_hasaki_data()
